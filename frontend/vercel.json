@@ -1,0 +1,28 @@
+{
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "env": {
+    "NEXT_PUBLIC_API_URL": {
+      "description": "Backend API URL",
+      "value": "https://api.hospital-stress.example.com"
+    },
+    "NEXTAUTH_URL": {
+      "description": "Frontend URL for NextAuth",
+      "value": "https://hospital-stress.example.com"
+    },
+    "NEXTAUTH_SECRET": {
+      "description": "Secret for NextAuth session encryption",
+      "value": "@nextauth-secret"
+    },
+    "GOOGLE_CLIENT_ID": {
+      "description": "Google OAuth Client ID",
+      "value": "@google-client-id"
+    },
+    "GOOGLE_CLIENT_SECRET": {
+      "description": "Google OAuth Client Secret",
+      "value": "@google-client-secret"
+    }
+  }
+}
