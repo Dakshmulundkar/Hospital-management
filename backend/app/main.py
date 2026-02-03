@@ -1,20 +1,28 @@
 """FastAPI application entry point"""
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel, Field
 
 from app.services.synthetic_data_generator import SyntheticDataGenerator
 from app.services.prediction_engine import PredictionEngine
 from app.services.alert_service import AlertService, AlertThresholds
-from app.models import HospitalRecord
+from app.services.upload_handler import UploadHandler
+from app.models import (
+    HospitalRecord, BedForecast, StaffRiskScore, Recommendation, 
+    AlertData, ScenarioRequest, ScenarioResult, DashboardData
+)
+from app.db.bigquery_client import bigquery_client
+from app.db.vertex_ai_client import vertex_ai_client
+from app.db.redis_client import redis_client
 
 app = FastAPI(
     title="Hospital Stress Early Warning System",
     description="AI-powered hospital capacity prediction and alerting system",
-    version="0.1.0"
+    version="1.0.0"
 )
 
 # Configure CORS
@@ -25,6 +33,50 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Pydantic models for API requests/responses
+class UploadResponse(BaseModel):
+    status: str
+    record_count: int
+    warnings: List[str] = []
+    message: str
+
+class PredictRequest(BaseModel):
+    days_ahead: int = Field(default=7, ge=1, le=30)
+    use_cache: bool = True
+
+class StaffRiskRequest(BaseModel):
+    predicted_admissions: int = Field(ge=0)
+    current_staff: int = Field(ge=1)
+    use_cache: bool = True
+
+class RecommendationRequest(BaseModel):
+    bed_stress: float = Field(ge=0, le=100)
+    staff_risk: float = Field(ge=0, le=100)
+    include_historical: bool = True
+
+class AlertRequest(BaseModel):
+    alert_type: str = Field(regex="^(bed_stress|staff_risk)$")
+    risk_score: float = Field(ge=0, le=100)
+    threshold: float = Field(ge=0, le=100)
+    recipients: List[str]
+    send_slack: bool = False
+
+class AlertResponse(BaseModel):
+    status: str
+    email_sent: bool
+    slack_sent: bool
+    message: str
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: str
+    timestamp: str
+
+# Initialize services
+prediction_engine = PredictionEngine()
+alert_service = AlertService()
+upload_handler = UploadHandler()
 
 # Global data storage (in-memory for demo)
 hospital_data: List[HospitalRecord] = []
@@ -500,4 +552,432 @@ async def get_recommendations():
             }
             for rec in recommendations
         ]
+    }
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.post("/upload-logs", response_model=UploadResponse)
+async def upload_logs(file: UploadFile = File(...)):
+    """
+    Upload CSV file with hospital logs
+    
+    Accepts CSV file and stores records in BigQuery
+    Returns upload status and record count
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.csv'):
+            raise HTTPException(
+                status_code=400, 
+                detail="File must be a CSV file"
+            )
+        
+        # Check file size
+        if not upload_handler.check_file_size(file):
+            raise HTTPException(
+                status_code=413,
+                detail="File size exceeds 50MB limit"
+            )
+        
+        # Validate CSV schema and content
+        validation_result = upload_handler.validate_csv(file)
+        if not validation_result.is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid CSV: {'; '.join(validation_result.errors)}"
+            )
+        
+        # Parse CSV into records
+        records = upload_handler.parse_csv(file)
+        
+        # Store records in BigQuery
+        storage_result = upload_handler.store_records(records)
+        
+        # Invalidate prediction cache since new data was uploaded
+        prediction_engine.invalidate_cache()
+        
+        return UploadResponse(
+            status="success",
+            record_count=len(records),
+            warnings=validation_result.warnings,
+            message=f"Successfully uploaded {len(records)} records"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@app.post("/predict-beds", response_model=dict)
+async def predict_beds(request: PredictRequest):
+    """
+    Generate bed demand forecast
+    
+    Returns 7-day bed demand forecasts with confidence scores
+    """
+    try:
+        # Generate forecast
+        forecast = prediction_engine.forecast_bed_demand(
+            days_ahead=request.days_ahead
+        )
+        
+        # Convert to response format
+        return {
+            "predictions": [
+                {
+                    "date": pred.date.isoformat(),
+                    "predicted_beds": pred.predicted_beds,
+                    "bed_stress": pred.bed_stress,
+                    "confidence": pred.confidence,
+                    "is_high_risk": pred.is_high_risk
+                }
+                for pred in forecast.predictions
+            ],
+            "overall_confidence": forecast.overall_confidence,
+            "generated_at": forecast.generated_at.isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating forecast: {str(e)}"
+        )
+
+@app.post("/staff-risk", response_model=dict)
+async def staff_risk(request: StaffRiskRequest):
+    """
+    Calculate staff overload risk
+    
+    Returns staff risk scores with confidence scores
+    """
+    try:
+        # Calculate staff risk
+        risk_score = prediction_engine.calculate_staff_risk(
+            predicted_admissions=request.predicted_admissions,
+            current_staff=request.current_staff
+        )
+        
+        # Convert to response format
+        return {
+            "risk_score": risk_score.risk_score,
+            "confidence": risk_score.confidence,
+            "is_critical": risk_score.is_critical,
+            "contributing_factors": risk_score.contributing_factors,
+            "generated_at": risk_score.generated_at.isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating staff risk: {str(e)}"
+        )
+
+@app.get("/dashboard-data", response_model=dict)
+async def dashboard_data():
+    """
+    Get comprehensive dashboard data
+    
+    Returns 7-day stress summary for dashboard
+    """
+    try:
+        # Get dashboard data from prediction engine
+        data = prediction_engine.get_dashboard_data()
+        
+        # Convert to response format
+        return {
+            "bed_stress_current": data.bed_stress_current,
+            "staff_risk_current": data.staff_risk_current,
+            "active_alerts_count": data.active_alerts_count,
+            "recommendations_count": data.recommendations_count,
+            "seven_day_forecast": {
+                "predictions": [
+                    {
+                        "date": pred.date.isoformat(),
+                        "predicted_beds": pred.predicted_beds,
+                        "bed_stress": pred.bed_stress,
+                        "confidence": pred.confidence,
+                        "is_high_risk": pred.is_high_risk
+                    }
+                    for pred in data.seven_day_forecast.predictions
+                ],
+                "overall_confidence": data.seven_day_forecast.overall_confidence,
+                "generated_at": data.seven_day_forecast.generated_at.isoformat()
+            },
+            "seven_day_staff_risk": [
+                {
+                    "risk_score": risk.risk_score,
+                    "confidence": risk.confidence,
+                    "is_critical": risk.is_critical,
+                    "contributing_factors": risk.contributing_factors,
+                    "generated_at": risk.generated_at.isoformat()
+                }
+                for risk in data.seven_day_staff_risk
+            ],
+            "trend_indicators": data.trend_indicators
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting dashboard data: {str(e)}"
+        )
+
+@app.post("/recommendations", response_model=dict)
+async def recommendations(request: RecommendationRequest):
+    """
+    Generate prioritized recommendations
+    
+    Returns 3 prioritized recommendations with cost estimates
+    """
+    try:
+        # Generate recommendations
+        recs = prediction_engine.generate_recommendations(
+            bed_stress=request.bed_stress,
+            staff_risk=request.staff_risk
+        )
+        
+        # Convert to response format
+        return {
+            "recommendations": [
+                {
+                    "title": rec.title,
+                    "description": rec.description,
+                    "rationale": rec.rationale,
+                    "cost_estimate": rec.cost_estimate,
+                    "impact_score": rec.impact_score,
+                    "priority": rec.priority,
+                    "implementation_time": rec.implementation_time
+                }
+                for rec in recs
+            ]
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating recommendations: {str(e)}"
+        )
+
+@app.post("/send-alert", response_model=AlertResponse)
+async def send_alert(request: AlertRequest):
+    """
+    Send email or Slack notification
+    
+    Triggers email or Slack notifications based on request
+    """
+    try:
+        # Create alert data
+        alert_data = AlertData(
+            alert_type=request.alert_type,
+            risk_score=request.risk_score,
+            threshold=request.threshold,
+            predictions=[],  # Would be populated with actual predictions
+            recommendations=[],  # Would be populated with actual recommendations
+            generated_at=datetime.now()
+        )
+        
+        # Send email alert
+        email_result = alert_service.send_email_alert(
+            recipients=request.recipients,
+            alert_data=alert_data
+        )
+        
+        # Send Slack alert if requested
+        slack_result = None
+        if request.send_slack:
+            slack_result = alert_service.send_slack_alert(
+                webhook_url="",  # Would come from settings
+                alert_data=alert_data
+            )
+        
+        return AlertResponse(
+            status="success",
+            email_sent=email_result.success if email_result else False,
+            slack_sent=slack_result.success if slack_result else False,
+            message="Alert sent successfully"
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error sending alert: {str(e)}"
+        )
+
+@app.post("/simulate-scenario", response_model=dict)
+async def simulate_scenario(request: ScenarioRequest):
+    """
+    Run what-if scenario simulation
+    
+    Returns scenario results with modified predictions
+    """
+    try:
+        # Validate scenario parameters
+        if not (0.0 <= request.sick_rate <= 0.5):
+            raise HTTPException(
+                status_code=400,
+                detail="sick_rate must be between 0.0 and 0.5"
+            )
+        
+        if not (-0.3 <= request.admission_surge <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="admission_surge must be between -0.3 and 1.0"
+            )
+        
+        # Run scenario simulation
+        result = prediction_engine.simulate_scenario(
+            sick_rate=request.sick_rate,
+            admission_surge=request.admission_surge,
+            baseline_date=request.baseline_date
+        )
+        
+        # Convert to response format
+        return {
+            "baseline_forecast": {
+                "predictions": [
+                    {
+                        "date": pred.date.isoformat(),
+                        "predicted_beds": pred.predicted_beds,
+                        "bed_stress": pred.bed_stress,
+                        "confidence": pred.confidence,
+                        "is_high_risk": pred.is_high_risk
+                    }
+                    for pred in result.baseline_forecast.predictions
+                ],
+                "overall_confidence": result.baseline_forecast.overall_confidence,
+                "generated_at": result.baseline_forecast.generated_at.isoformat()
+            },
+            "scenario_forecast": {
+                "predictions": [
+                    {
+                        "date": pred.date.isoformat(),
+                        "predicted_beds": pred.predicted_beds,
+                        "bed_stress": pred.bed_stress,
+                        "confidence": pred.confidence,
+                        "is_high_risk": pred.is_high_risk
+                    }
+                    for pred in result.scenario_forecast.predictions
+                ],
+                "overall_confidence": result.scenario_forecast.overall_confidence,
+                "generated_at": result.scenario_forecast.generated_at.isoformat()
+            },
+            "baseline_staff_risk": {
+                "risk_score": result.baseline_staff_risk.risk_score,
+                "confidence": result.baseline_staff_risk.confidence,
+                "is_critical": result.baseline_staff_risk.is_critical,
+                "contributing_factors": result.baseline_staff_risk.contributing_factors,
+                "generated_at": result.baseline_staff_risk.generated_at.isoformat()
+            },
+            "scenario_staff_risk": {
+                "risk_score": result.scenario_staff_risk.risk_score,
+                "confidence": result.scenario_staff_risk.confidence,
+                "is_critical": result.scenario_staff_risk.is_critical,
+                "contributing_factors": result.scenario_staff_risk.contributing_factors,
+                "generated_at": result.scenario_staff_risk.generated_at.isoformat()
+            },
+            "impact_summary": result.impact_summary
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error running scenario simulation: {str(e)}"
+        )
+
+# ============================================================================
+# HEALTH CHECK ENDPOINTS
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """
+    Liveness probe - basic health check
+    
+    Returns 200 if service is running
+    """
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "Hospital Stress Early Warning System",
+        "version": "1.0.0"
+    }
+
+@app.get("/ready")
+async def readiness_check():
+    """
+    Readiness probe - comprehensive service check
+    
+    Checks all external dependencies and returns 200 if ready to serve traffic
+    """
+    health_status = {
+        "status": "ready",
+        "timestamp": datetime.now().isoformat(),
+        "checks": {}
+    }
+    
+    all_healthy = True
+    
+    # Check BigQuery connectivity
+    try:
+        bigquery_healthy = await bigquery_client.check_connection()
+        health_status["checks"]["bigquery"] = "healthy" if bigquery_healthy else "unhealthy"
+        if not bigquery_healthy:
+            all_healthy = False
+    except Exception as e:
+        health_status["checks"]["bigquery"] = f"error: {str(e)}"
+        all_healthy = False
+    
+    # Check Vertex AI availability
+    try:
+        vertex_healthy = await vertex_ai_client.check_connection()
+        health_status["checks"]["vertex_ai"] = "healthy" if vertex_healthy else "unhealthy"
+        if not vertex_healthy:
+            all_healthy = False
+    except Exception as e:
+        health_status["checks"]["vertex_ai"] = f"error: {str(e)}"
+        all_healthy = False
+    
+    # Check Redis connectivity
+    try:
+        redis_healthy = await redis_client.check_connection()
+        health_status["checks"]["redis"] = "healthy" if redis_healthy else "unhealthy"
+        if not redis_healthy:
+            all_healthy = False
+    except Exception as e:
+        health_status["checks"]["redis"] = f"error: {str(e)}"
+        all_healthy = False
+    
+    if not all_healthy:
+        health_status["status"] = "not_ready"
+        raise HTTPException(status_code=503, detail=health_status)
+    
+    return health_status
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Handle HTTP exceptions with consistent error format"""
+    return {
+        "error": exc.detail,
+        "detail": f"HTTP {exc.status_code}",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    """Handle general exceptions with consistent error format"""
+    return {
+        "error": "Internal server error",
+        "detail": str(exc),
+        "timestamp": datetime.now().isoformat()
     }

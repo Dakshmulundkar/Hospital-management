@@ -6,10 +6,12 @@ python-multipart==0.0.6
 google-cloud-bigquery==3.14.1
 google-cloud-aiplatform==1.38.1
 redis==5.0.1
-pandas==2.1.4
+pandas==2.2.0
 numpy==1.26.3
 hypothesis==6.92.1
 pytest==7.4.3
 pytest-asyncio==0.23.3
 httpx==0.26.0
 python-dotenv==1.0.0
+sendgrid==6.11.0
+requests==2.31.0
