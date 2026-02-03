@@ -18,7 +18,7 @@ import {
   Bell,
   ArrowRight,
   ArrowLeft,
-  Skip,
+  SkipForward,
   Save,
   Shield,
   Heart,
@@ -156,7 +156,7 @@ export default function OnboardingPage() {
     router.push('/(authenticated)/dashboard')
   }
 
-  const handleFileUpload = async (file: File) => {
+  const handleFileUpload = async (_file: File) => {
     // Simulate file upload
     setCsvUploaded(true)
     completeStep(1)
@@ -527,7 +527,7 @@ export default function OnboardingPage() {
               onClick={skipOnboardingProcess}
               className="rounded-xl"
             >
-              <Skip className="h-4 w-4 mr-2" />
+              <SkipForward className="h-4 w-4 mr-2" />
               Skip Setup
             </Button>
           </div>

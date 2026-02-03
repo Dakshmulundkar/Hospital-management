@@ -3,7 +3,7 @@
 import { useSession } from "next-auth/react"
 import { useRouter } from "next/navigation"
 import { useEffect } from "react"
-import { Navigation } from "@/components/navigation"
+import Navigation from "@/components/navigation"
 
 export default function AuthenticatedLayout({
   children,
